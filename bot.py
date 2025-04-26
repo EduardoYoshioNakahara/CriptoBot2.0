@@ -8,7 +8,7 @@ import csv
 from datetime import datetime
 
 # 🧠 Configurações do bot
-TOKEN = '8165557546:AAEiKshBi7tir2EjAy62NDa7mvXGr4h19Lg'
+TOKEN = '8194783339:AAHa0wW2QiFdvocAwk1vVowOD2QrQRGlD4U'
 CHAT_ID = '2091781134'
 
 bot = telebot.TeleBot(TOKEN)
