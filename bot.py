@@ -8,8 +8,8 @@ import csv
 from datetime import datetime
 
 # 🧠 Configurações do bot
-TOKEN = 'SEU_TOKEN_AQUI'
-CHAT_ID = 'SEU_CHAT_ID_AQUI'
+TOKEN = '8165557546:AAEiKshBi7tir2EjAy62NDa7mvXGr4h19Lg'
+CHAT_ID = '2091781134'
 
 bot = telebot.TeleBot(TOKEN)
 exchange = ccxt.binance()
