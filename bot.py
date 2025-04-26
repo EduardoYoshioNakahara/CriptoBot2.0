@@ -1,109 +1,120 @@
-# ====================
-# bot.py
-# ====================
-
-import ccxt
-import pandas as pd
-import numpy as np
-import ta
 import time
-import telebot
-from datetime import datetime
-import csv
+import requests
+import pandas as pd
+import ccxt
 
-# Configurações do bot
+# ================= CONFIGURAÇÕES =================
 TOKEN = '8194783339:AAHa0wW2QiFdvocAwk1vVowOD2QrQRGlD4U'
 CHAT_ID = '2091781134'
 
-bot = telebot.TeleBot(TOKEN)
-exchange = ccxt.binance()
+PARES = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'BNB/USDT']
+TIMEFRAME = '30m'
+INTERVALO = 60 * 30  # 30 minutos
 
-# Pares para acompanhar
-symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT']
-timeframe = '1h'
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'},
+})
 
-open_trades = {}
+# Função para enviar mensagens no Telegram
+def enviar_telegram(mensagem):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {
+        'chat_id': CHAT_ID,
+        'text': mensagem,
+        'parse_mode': 'HTML'
+    }
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        print(f"Erro ao enviar mensagem: {e}")
 
-# CSV para salvar operações
-csv_file = 'operations.csv'
-try:
-    pd.read_csv(csv_file)
-except:
-    with open(csv_file, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['datetime', 'symbol', 'type', 'entry', 'result', 'value'])
+# Função para buscar dados do par
+def buscar_dados(par):
+    try:
+        ohlcv = exchange.fetch_ohlcv(par, timeframe=TIMEFRAME, limit=100)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        return df
+    except Exception as e:
+        print(f"Erro ao buscar dados de {par}: {e}")
+        return None
 
-def log_operation(symbol, type_, entry, result, value):
-    with open(csv_file, mode='a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([datetime.now(), symbol, type_, entry, result, value])
-
-def get_data(symbol):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-
-    df['EMA9'] = ta.trend.ema_indicator(df['close'], window=9)
-    df['EMA21'] = ta.trend.ema_indicator(df['close'], window=21)
-    df['RSI'] = ta.momentum.rsi(df['close'], window=14)
-
+# Função para calcular EMA e RSI
+def indicadores(df):
+    df['EMA9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['EMA21'] = df['close'].ewm(span=21, adjust=False).mean()
+    df['RSI'] = calcular_rsi(df['close'], 14)
     return df
 
-def check_signals():
-    for symbol in symbols:
-        df = get_data(symbol)
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        price = last['close']
+def calcular_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-        if symbol not in open_trades:
-            # Entrada de compra
-            if prev['EMA9'] < prev['EMA21'] and last['EMA9'] > last['EMA21'] and last['RSI'] > 50:
-                sl = price * 0.98
-                tp = price * 1.02
-                open_trades[symbol] = {'entry': price, 'sl': sl, 'tp': tp, 'time': datetime.now(), 'type': 'buy'}
-                bot.send_message(CHAT_ID, f'🟢 COMPRA: {symbol}\n💰 Entrada: {price:.2f}\n🎯 TP: {tp:.2f}\n🛡️ SL: {sl:.2f}')
-            # Entrada de venda
-            elif prev['EMA9'] > prev['EMA21'] and last['EMA9'] < last['EMA21'] and last['RSI'] < 50:
-                sl = price * 1.02
-                tp = price * 0.98
-                open_trades[symbol] = {'entry': price, 'sl': sl, 'tp': tp, 'time': datetime.now(), 'type': 'sell'}
-                bot.send_message(CHAT_ID, f'🔴 VENDA: {symbol}\n💰 Entrada: {price:.2f}\n🎯 TP: {tp:.2f}\n🛡️ SL: {sl:.2f}')
-        else:
-            entry = open_trades[symbol]['entry']
-            sl = open_trades[symbol]['sl']
-            tp = open_trades[symbol]['tp']
-            type_ = open_trades[symbol]['type']
+# Função para analisar sinais
+def analisar_par(par):
+    df = buscar_dados(par)
+    if df is None:
+        return
+    df = indicadores(df)
 
-            if type_ == 'buy':
-                if price >= tp:
-                    bot.send_message(CHAT_ID, f'✅ LUCRO: {symbol} atingiu o TP ({tp:.2f})')
-                    log_operation(symbol, 'buy', entry, 'gain', tp)
-                    del open_trades[symbol]
-                elif price <= sl:
-                    bot.send_message(CHAT_ID, f'❌ PREJUÍZO: {symbol} atingiu o SL ({sl:.2f})')
-                    log_operation(symbol, 'buy', entry, 'loss', sl)
-                    del open_trades[symbol]
-                else:
-                    bot.send_message(CHAT_ID, f'📊 {symbol} ainda aberto\nAtual: {price:.2f} | Entrada: {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}')
+    try:
+        # Detectar compra
+        if (
+            df['EMA9'].iloc[-2] < df['EMA21'].iloc[-2] and
+            df['EMA9'].iloc[-1] > df['EMA21'].iloc[-1] and
+            40 <= df['RSI'].iloc[-1] <= 60 and
+            (df['close'].iloc[-1] > df['open'].iloc[-1])
+        ):
+            entrada = df['close'].iloc[-1]
+            stop_loss = df['low'].iloc[-5:-1].min()
+            take_profit = entrada + (entrada - stop_loss) * 2
+            mensagem = f"""
+🔔 <b>NOVO SINAL DE SCALPING</b>
+<b>Par:</b> {par}
+<b>Tipo:</b> 🟢 COMPRA
+<b>Preço de Entrada:</b> {entrada:.4f}
+🎯 <b>Take Profit:</b> {take_profit:.4f}
+🛑 <b>Stop Loss:</b> {stop_loss:.4f}
+⏰ <b>Timeframe:</b> 30m
+"""
+            enviar_telegram(mensagem)
 
-            elif type_ == 'sell':
-                if price <= tp:
-                    bot.send_message(CHAT_ID, f'✅ LUCRO: {symbol} atingiu o TP ({tp:.2f})')
-                    log_operation(symbol, 'sell', entry, 'gain', tp)
-                    del open_trades[symbol]
-                elif price >= sl:
-                    bot.send_message(CHAT_ID, f'❌ PREJUÍZO: {symbol} atingiu o SL ({sl:.2f})')
-                    log_operation(symbol, 'sell', entry, 'loss', sl)
-                    del open_trades[symbol]
-                else:
-                    bot.send_message(CHAT_ID, f'📊 {symbol} ainda aberto\nAtual: {price:.2f} | Entrada: {entry:.2f} | SL: {sl:.2f} | TP: {tp:.2f}')
+        # Detectar venda
+        elif (
+            df['EMA9'].iloc[-2] > df['EMA21'].iloc[-2] and
+            df['EMA9'].iloc[-1] < df['EMA21'].iloc[-1] and
+            40 <= df['RSI'].iloc[-1] <= 60 and
+            (df['close'].iloc[-1] < df['open'].iloc[-1])
+        ):
+            entrada = df['close'].iloc[-1]
+            stop_loss = df['high'].iloc[-5:-1].max()
+            take_profit = entrada - (stop_loss - entrada) * 2
+            mensagem = f"""
+🔔 <b>NOVO SINAL DE SCALPING</b>
+<b>Par:</b> {par}
+<b>Tipo:</b> 🔴 VENDA
+<b>Preço de Entrada:</b> {entrada:.4f}
+🎯 <b>Take Profit:</b> {take_profit:.4f}
+🛑 <b>Stop Loss:</b> {stop_loss:.4f}
+⏰ <b>Timeframe:</b> 30m
+"""
+            enviar_telegram(mensagem)
 
-# Mensagem de inicio
-bot.send_message(CHAT_ID, '🚀 Bot de Trade iniciado com sucesso!\nAguardando sinais...')
+    except Exception as e:
+        print(f"Erro ao analisar {par}: {e}")
 
 # Loop principal
-while True:
-    check_signals()
-    time.sleep(900)  # 15 minutos
+def main():
+    enviar_telegram("🚀 Bot de Scalping Trade iniciado com sucesso! Aguardando sinais...")
+    while True:
+        for par in PARES:
+            analisar_par(par)
+        time.sleep(INTERVALO)
+
+if __name__ == "__main__":
+    main()
