@@ -9,7 +9,10 @@ CHAT_ID = '2091781134'
 
 PARES = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'BNB/USDT']
 TIMEFRAME = '30m'
-INTERVALO = 60 * 30  # 30 minutos
+INTERVALO = 60 * 5  # 5 minutos
+
+# Mínima diferença entre EMAs no cruzamento (em % do preço)
+DIFERENCA_EMA_MINIMA = 0.0005  # 0.05%
 
 exchange = ccxt.binance({
     'enableRateLimit': True,
@@ -58,19 +61,25 @@ def calcular_rsi(series, period=14):
 # Função para analisar sinais
 def analisar_par(par):
     df = buscar_dados(par)
-    if df is None:
+    if df is None or len(df) < 22:
         return
     df = indicadores(df)
 
     try:
+        preco_atual = df['close'].iloc[-1]
+
+        # Distância das EMAs no último candle
+        distancia_ema = abs(df['EMA9'].iloc[-1] - df['EMA21'].iloc[-1])
+
         # Detectar compra
         if (
             df['EMA9'].iloc[-2] < df['EMA21'].iloc[-2] and
             df['EMA9'].iloc[-1] > df['EMA21'].iloc[-1] and
-            40 <= df['RSI'].iloc[-1] <= 60 and
-            (df['close'].iloc[-1] > df['open'].iloc[-1])
+            df['RSI'].iloc[-1] > 40 and
+            distancia_ema > preco_atual * DIFERENCA_EMA_MINIMA and
+            df['close'].iloc[-1] > df['open'].iloc[-1]
         ):
-            entrada = df['close'].iloc[-1]
+            entrada = preco_atual
             stop_loss = df['low'].iloc[-5:-1].min()
             take_profit = entrada + (entrada - stop_loss) * 2
             mensagem = f"""
@@ -88,10 +97,11 @@ def analisar_par(par):
         elif (
             df['EMA9'].iloc[-2] > df['EMA21'].iloc[-2] and
             df['EMA9'].iloc[-1] < df['EMA21'].iloc[-1] and
-            40 <= df['RSI'].iloc[-1] <= 60 and
-            (df['close'].iloc[-1] < df['open'].iloc[-1])
+            df['RSI'].iloc[-1] < 60 and
+            distancia_ema > preco_atual * DIFERENCA_EMA_MINIMA and
+            df['close'].iloc[-1] < df['open'].iloc[-1]
         ):
-            entrada = df['close'].iloc[-1]
+            entrada = preco_atual
             stop_loss = df['high'].iloc[-5:-1].max()
             take_profit = entrada - (stop_loss - entrada) * 2
             mensagem = f"""
