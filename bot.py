@@ -1,130 +1,188 @@
+import os
 import time
+import logging
+import sqlite3
+import schedule
+import ccxt
 import requests
 import pandas as pd
-import ccxt
+import numpy as np
 
-# ================= CONFIGURAÇÕES =================
-TOKEN = '8194783339:AAHa0wW2QiFdvocAwk1vVowOD2QrQRGlD4U'
-CHAT_ID = '2091781134'
+from dotenv import load_dotenv
 
-PARES = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'BNB/USDT']
-TIMEFRAME = '30m'
-INTERVALO = 60 * 5  # 5 minutos
+# Carrega variáveis de ambiente de .env
+load_dotenv()
 
-# Mínima diferença entre EMAs no cruzamento (em % do preço)
-DIFERENCA_EMA_MINIMA = 0.0005  # 0.05%
+# Configuração de logging
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO,
+    filename=os.getenv("LOG_FILE", "bot.log")
+)
 
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'},
+# Configuração da exchange (Binance)
+binance = ccxt.binance({
+    'apiKey': os.getenv('BINANCE_API_KEY'),
+    'secret': os.getenv('BINANCE_API_SECRET')
 })
 
-# Função para enviar mensagens no Telegram
-def enviar_telegram(mensagem):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        'chat_id': CHAT_ID,
-        'text': mensagem,
-        'parse_mode': 'HTML'
-    }
-    try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        print(f"Erro ao enviar mensagem: {e}")
+# Telegram
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHAT_ID = os.getenv('CHAT_ID')
 
-# Função para buscar dados do par
-def buscar_dados(par):
-    try:
-        ohlcv = exchange.fetch_ohlcv(par, timeframe=TIMEFRAME, limit=100)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        return df
-    except Exception as e:
-        print(f"Erro ao buscar dados de {par}: {e}")
+# Parâmetros de estratégia, gestão de risco e stake fixa
+CONFIG = {
+    'pairs': os.getenv('PAIRS', 'BTC/USDT').split(','),
+    'timeframes': os.getenv('TIMEFRAMES', '1h,4h').split(','),
+    'limit': int(os.getenv('LIMIT', '100')),
+    'ema_short': int(os.getenv('EMA_SHORT', '9')),
+    'ema_long': int(os.getenv('EMA_LONG', '21')),
+    'rsi_period': int(os.getenv('RSI_PERIOD', '14')),
+    'atr_period': int(os.getenv('ATR_PERIOD', '14')),
+    'volume_ma_period': int(os.getenv('VOL_MA_PERIOD', '20')),
+    'risk_per_trade': float(os.getenv('RISK_PER_TRADE', '0.02')),
+    'max_daily_drawdown': float(os.getenv('MAX_DAILY_DRAWDOWN', '0.05')),
+    'interval_min': int(os.getenv('INTERVAL_MIN', '15')),
+    'stake_usdt': float(os.getenv('STAKE_USDT', '10'))  # Valor fixo por entrada
+}
+
+# Banco de dados local
+conn = sqlite3.connect(os.getenv('DB_PATH', 'trades.db'), check_same_thread=False)
+c = conn.cursor()
+c.execute("""
+CREATE TABLE IF NOT EXISTS trades(
+    ts TEXT,
+    symbol TEXT,
+    side TEXT,
+    price REAL,
+    result REAL
+)
+""")
+conn.commit()
+
+class TradeBot:
+    def __init__(self, exchange, token, chat_id, config):
+        self.exchange = exchange
+        self.token = token
+        self.chat_id = chat_id
+        self.config = config
+        self.last_signal = {s: None for s in config['pairs']}
+
+    def safe_request(self, url, params, retries=3, delay=5):
+        for i in range(retries):
+            try:
+                r = requests.get(url, params=params, timeout=10)
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                logging.warning(f"Request falhou ({i+1}/{retries}): {e}")
+                time.sleep(delay)
+        logging.error("Request falhou definitivamente")
         return None
 
-# Função para calcular EMA e RSI
-def indicadores(df):
-    df['EMA9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['EMA21'] = df['close'].ewm(span=21, adjust=False).mean()
-    df['RSI'] = calcular_rsi(df['close'], 14)
-    return df
+    def send_telegram(self, message):
+        url = f'https://api.telegram.org/bot{self.token}/sendMessage'
+        params = {'chat_id': self.chat_id, 'text': message}
+        self.safe_request(url, params)
+        logging.info(f"Telegram: {message}")
 
-def calcular_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period, min_periods=1).mean()
-    avg_loss = loss.rolling(window=period, min_periods=1).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    def send_open_order_status(self, symbol, side, entry, stop_loss, take_profit, status, pnl):
+        msg = (
+            f"📝 ORDEM EM ABERTO: {symbol}\n"
+            f"Tipo: {side}\n"
+            f"Entrada: {entry:.2f}\n"
+            f"Stop Loss: {stop_loss:.2f}\n"
+            f"Take Profit: {take_profit:.2f}\n"
+            f"Status: {status}\n"
+            f"Lucro/Perda: {pnl:.2f} USDT"
+        )
+        self.send_telegram(msg)
 
-# Função para analisar sinais
-def analisar_par(par):
-    df = buscar_dados(par)
-    if df is None or len(df) < 22:
-        return
-    df = indicadores(df)
+    def fetch_ohlcv(self, symbol, timeframe):
+        ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=self.config['limit'])
+        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
 
-    try:
-        preco_atual = df['close'].iloc[-1]
+    def calculate_indicators(self, df):
+        df['ema_short'] = df['close'].ewm(span=self.config['ema_short'], adjust=False).mean()
+        df['ema_long'] = df['close'].ewm(span=self.config['ema_long'], adjust=False).mean()
+        # RSI
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window=self.config['rsi_period'], min_periods=1).mean()
+        avg_loss = loss.rolling(window=self.config['rsi_period'], min_periods=1).mean()
+        df['rsi'] = 100 - (100/(1 + avg_gain/avg_loss))
+        # ATR
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift()).abs()
+        low_close = (df['low'] - df['close'].shift()).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['atr'] = tr.rolling(window=self.config['atr_period'], min_periods=1).mean()
+        # Volume MA
+        df['vol_ma'] = df['volume'].rolling(window=self.config['volume_ma_period'], min_periods=1).mean()
+        return df
 
-        # Distância das EMAs no último candle
-        distancia_ema = abs(df['EMA9'].iloc[-1] - df['EMA21'].iloc[-1])
+    def get_account_balance(self):
+        bal = self.exchange.fetch_balance()
+        return bal['total'].get('USDT', 0)
 
-        # Detectar compra
-        if (
-            df['EMA9'].iloc[-2] < df['EMA21'].iloc[-2] and
-            df['EMA9'].iloc[-1] > df['EMA21'].iloc[-1] and
-            df['RSI'].iloc[-1] > 40 and
-            distancia_ema > preco_atual * DIFERENCA_EMA_MINIMA and
-            df['close'].iloc[-1] > df['open'].iloc[-1]
-        ):
-            entrada = preco_atual
-            stop_loss = df['low'].iloc[-5:-1].min()
-            take_profit = entrada + (entrada - stop_loss) * 2
-            mensagem = f"""
-🔔 <b>NOVO SINAL DE SCALPING</b>
-<b>Par:</b> {par}
-<b>Tipo:</b> 🟢 COMPRA
-<b>Preço de Entrada:</b> {entrada:.4f}
-🎯 <b>Take Profit:</b> {take_profit:.4f}
-🛑 <b>Stop Loss:</b> {stop_loss:.4f}
-⏰ <b>Timeframe:</b> 30m
-"""
-            enviar_telegram(mensagem)
+    def calculate_position_size(self, entry_price, atr):
+        # Usa stake fixa em USDT e calcula quantidade
+        stake = self.config['stake_usdt']
+        size = stake / entry_price if entry_price > 0 else 0
+        return size
 
-        # Detectar venda
-        elif (
-            df['EMA9'].iloc[-2] > df['EMA21'].iloc[-2] and
-            df['EMA9'].iloc[-1] < df['EMA21'].iloc[-1] and
-            df['RSI'].iloc[-1] < 60 and
-            distancia_ema > preco_atual * DIFERENCA_EMA_MINIMA and
-            df['close'].iloc[-1] < df['open'].iloc[-1]
-        ):
-            entrada = preco_atual
-            stop_loss = df['high'].iloc[-5:-1].max()
-            take_profit = entrada - (stop_loss - entrada) * 2
-            mensagem = f"""
-🔔 <b>NOVO SINAL DE SCALPING</b>
-<b>Par:</b> {par}
-<b>Tipo:</b> 🔴 VENDA
-<b>Preço de Entrada:</b> {entrada:.4f}
-🎯 <b>Take Profit:</b> {take_profit:.4f}
-🛑 <b>Stop Loss:</b> {stop_loss:.4f}
-⏰ <b>Timeframe:</b> 30m
-"""
-            enviar_telegram(mensagem)
+    def log_trade(self, symbol, side, price, result):
+        ts = pd.Timestamp.utcnow().isoformat()
+        c.execute(
+            "INSERT INTO trades(ts, symbol, side, price, result) VALUES(?,?,?, ?,?)",
+            (ts, symbol, side, price, result)
+        )
+        conn.commit()
 
-    except Exception as e:
-        print(f"Erro ao analisar {par}: {e}")
+    def confirm_multitimeframe(self, symbol):
+        signals = []
+        for tf in self.config['timeframes']:
+            df = self.fetch_ohlcv(symbol, tf)
+            df = self.calculate_indicators(df)
+            last, prev = df.iloc[-1], df.iloc[-2]
+            if last['ema_short'] > last['ema_long'] and prev['ema_short'] < prev['ema_long'] and last['rsi']<70 and last['volume']>last['vol_ma']:
+                signals.append('BUY')
+            elif last['ema_short'] < last['ema_long'] and prev['ema_short'] > prev['ema_long'] and last['rsi']>30 and last['volume']>last['vol_ma']:
+                signals.append('SELL')
+            else:
+                signals.append(None)
+        return signals.count(signals[0]) == len(signals) and signals[0]
 
-# Loop principal
-def main():
-    enviar_telegram("🚀 Bot de Scalping Trade iniciado com sucesso! Aguardando sinais...")
-    while True:
-        for par in PARES:
-            analisar_par(par)
-        time.sleep(INTERVALO)
+    def check_signals(self):
+        for symbol in self.config['pairs']:
+            signal = self.confirm_multitimeframe(symbol)
+            if signal and signal != self.last_signal[symbol]:
+                df = self.fetch_ohlcv(symbol, self.config['timeframes'][0])
+                df = self.calculate_indicators(df)
+                last = df.iloc[-1]
+                entry_price = last['close']
+                atr = last['atr']
+                side = 'Compra' if signal=='BUY' else 'Venda'
+                # calcula stop e take profit baseados em ATR e RR 1:2
+                stop_loss = entry_price - atr
+                take_profit = entry_price + 2*(entry_price - stop_loss)
+                pnl_initial = 0.0
+                # envia status de ordem aberta
+                self.send_open_order_status(symbol, side, entry_price, stop_loss, take_profit, 'Em Aberto', pnl_initial)
+                # registra e atualiza sinal
+                self.log_trade(symbol, side, entry_price, pnl_initial)
+                self.last_signal[symbol] = signal
 
-if __name__ == "__main__":
-    main()
+    def run(self):
+        self.send_telegram("Bot profissional iniciado com múltiplas melhorias.")
+        schedule.every(self.config['interval_min']).minutes.do(self.check_signals)
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+
+if __name__ == '__main__':
+    bot = TradeBot(binance, TELEGRAM_TOKEN, CHAT_ID, CONFIG)
+    bot.run()
