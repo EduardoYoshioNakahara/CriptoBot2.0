@@ -1,174 +1,116 @@
-import os
-import time
-import logging
-import sqlite3
-import ccxt
-import requests
 import pandas as pd
 import numpy as np
-
-from dotenv import load_dotenv
-
-# Carrega variáveis de ambiente de .env
-load_dotenv()
-
-# Configuração de logging
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.INFO,
-    filename=os.getenv("LOG_FILE", "bot.log")
-)
+import ccxt
+import time
+import requests
 
 # Configuração da exchange (Binance)
-binance = ccxt.binance({
-    'apiKey': os.getenv('BINANCE_API_KEY'),
-    'secret': os.getenv('BINANCE_API_SECRET')
-})
+exchange = ccxt.binance()
 
-# Telegram
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
+# Token do seu bot no Telegram
+TELEGRAM_TOKEN = '7986770725:AAHD3vqPIZNLHvyWVZnrHIT3xGGI1R9ZeoY'
+# ID do chat do Telegram para onde enviar a mensagem
+CHAT_ID = '2091781134'
 
-# Parâmetros de estratégia, gestão de risco e stake fixa
-CONFIG = {
-    'pairs': os.getenv('PAIRS', 'BTC/USDT').split(','),
-    'timeframes': os.getenv('TIMEFRAMES', '1h,4h').split(','),
-    'limit': int(os.getenv('LIMIT', '100')),
-    'ema_short': int(os.getenv('EMA_SHORT', '9')),
-    'ema_long': int(os.getenv('EMA_LONG', '21')),
-    'rsi_period': int(os.getenv('RSI_PERIOD', '14')),
-    'atr_period': int(os.getenv('ATR_PERIOD', '14')),
-    'volume_ma_period': int(os.getenv('VOL_MA_PERIOD', '20')),
-    'risk_per_trade': float(os.getenv('RISK_PER_TRADE', '0.02')),
-    'max_daily_drawdown': float(os.getenv('MAX_DAILY_DRAWDOWN', '0.05')),
-    'interval_min': int(os.getenv('INTERVAL_MIN', '15')),
-    'stake_usdt': float(os.getenv('STAKE_USDT', '10'))  # Valor fixo por entrada
-}
+# Função para calcular EMA
+def calculate_ema(data, period):
+    return data['close'].ewm(span=period, adjust=False).mean()
 
-# Banco de dados local
-conn = sqlite3.connect(os.getenv('DB_PATH', 'trades.db'), check_same_thread=False)
-c = conn.cursor()
-c.execute("""
-CREATE TABLE IF NOT EXISTS trades(
-    ts TEXT,
-    symbol TEXT,
-    side TEXT,
-    price REAL,
-    result REAL
-)
-""")
-conn.commit()
+# Função para calcular RSI
+def calculate_rsi(data, period):
+    delta = data['close'].diff()
+    gain = (delta.where(delta > 0, 0)).fillna(0)
+    loss = (-delta.where(delta < 0, 0)).fillna(0)
 
-class TradeBot:
-    def __init__(self, exchange, token, chat_id, config):
-        self.exchange = exchange
-        self.token = token
-        self.chat_id = chat_id
-        self.config = config
-        self.last_signal = {s: None for s in config['pairs']}
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
 
-    def safe_request(self, url, params, retries=3, delay=5):
-        for i in range(retries):
-            try:
-                r = requests.get(url, params=params, timeout=10)
-                r.raise_for_status()
-                return r.json()
-            except Exception as e:
-                logging.warning(f"Request falhou ({i+1}/{retries}): {e}")
-                time.sleep(delay)
-        logging.error("Request falhou definitivamente")
-        return None
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
 
-    def send_telegram(self, message):
-        url = f'https://api.telegram.org/bot{self.token}/sendMessage'
-        params = {'chat_id': self.chat_id, 'text': message}
-        self.safe_request(url, params)
-        logging.info(f"Telegram: {message}")
+    return rsi
 
-    def send_open_order_status(self, symbol, side, entry, stop_loss, take_profit, status, pnl):
-        msg = (
-            f"📝 ORDEM EM ABERTO: {symbol}\n"
-            f"Tipo: {side}\n"
-            f"Entrada: {entry:.2f}\n"
-            f"Stop Loss: {stop_loss:.2f}\n"
-            f"Take Profit: {take_profit:.2f}\n"
-            f"Status: {status}\n"
-            f"Lucro/Perda: {pnl:.2f} USDT"
-        )
-        self.send_telegram(msg)
+# Função para pegar os dados históricos de preços
+def get_data(symbol, timeframe='1h', limit=100):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
+    return data
 
-    def fetch_ohlcv(self, symbol, timeframe):
-        ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=self.config['limit'])
-        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
+# Função para enviar uma mensagem via Telegram
+def send_telegram_message(message):
+    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+    params = {
+        'chat_id': CHAT_ID,
+        'text': message
+    }
+    response = requests.get(url, params=params)
+    return response
 
-    def calculate_indicators(self, df):
-        df['ema_short'] = df['close'].ewm(span=self.config['ema_short'], adjust=False).mean()
-        df['ema_long'] = df['close'].ewm(span=self.config['ema_long'], adjust=False).mean()
-        # RSI
-        delta = df['close'].diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(window=self.config['rsi_period'], min_periods=1).mean()
-        avg_loss = loss.rolling(window=self.config['rsi_period'], min_periods=1).mean()
-        df['rsi'] = 100 - (100/(1 + avg_gain/avg_loss))
-        # ATR
-        high_low = df['high'] - df['low']
-        high_close = (df['high'] - df['close'].shift()).abs()
-        low_close = (df['low'] - df['close'].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df['atr'] = tr.rolling(window=self.config['atr_period'], min_periods=1).mean()
-        # Volume MA
-        df['vol_ma'] = df['volume'].rolling(window=self.config['volume_ma_period'], min_periods=1).mean()
-        return df
+# Parâmetros para EMA e RSI
+ema_short_period = 9
+ema_long_period = 21
+rsi_period = 14
 
-    def calculate_position_size(self, entry_price):
-        stake = self.config['stake_usdt']
-        return stake / entry_price if entry_price > 0 else 0
+# Função para formatar as mensagens de ordens abertas
+def format_open_order(order_type, price, stop_loss, take_profit):
+    return f"📝 ORDEM EM ABERTO: BTC/USDT\nTipo: {order_type}\nEntrada: {price}\nStop Loss: {stop_loss}\nTake Profit: {take_profit}\nStatus: Em andamento"
 
-    def confirm_multitimeframe(self, symbol):
-        signals = []
-        for tf in self.config['timeframes']:
-            df = self.fetch_ohlcv(symbol, tf)
-            df = self.calculate_indicators(df)
-            last, prev = df.iloc[-1], df.iloc[-2]
-            if last['ema_short'] > last['ema_long'] and prev['ema_short'] < prev['ema_long'] and last['rsi']<70 and last['volume']>last['vol_ma']:
-                signals.append('BUY')
-            elif last['ema_short'] < last['ema_long'] and prev['ema_short'] > prev['ema_long'] and last['rsi']>30 and last['volume']>last['vol_ma']:
-                signals.append('SELL')
-            else:
-                signals.append(None)
-        return signals.count(signals[0]) == len(signals) and signals[0]
+# Função para formatar as mensagens de ordens fechadas
+def format_closed_order(order_type, price, stop_loss, take_profit, profit_loss):
+    return f"📝 ORDEM FINALIZADA: BTC/USDT\nTipo: {order_type}\nEntrada: {price}\nStop Loss: {stop_loss}\nTake Profit: {take_profit}\nStatus: {'Lucros' if profit_loss >= 0 else 'Perdas'}\nLucro/Perda: {profit_loss} USDT"
 
-    def check_signals(self):
-        for symbol in self.config['pairs']:
-            signal = self.confirm_multitimeframe(symbol)
-            if signal and signal != self.last_signal[symbol]:
-                df = self.fetch_ohlcv(symbol, self.config['timeframes'][0])
-                df = self.calculate_indicators(df)
-                last = df.iloc[-1]
-                entry_price = last['close']
-                atr = last['atr']
-                side = 'Compra' if signal=='BUY' else 'Venda'
-                stop_loss = entry_price - atr
-                take_profit = entry_price + 2*(entry_price - stop_loss)
-                pnl_initial = 0.0
-                self.send_open_order_status(symbol, side, entry_price, stop_loss, take_profit, 'Em Aberto', pnl_initial)
-                self.log_trade(symbol, side, entry_price, pnl_initial)
-                self.last_signal[symbol] = signal
+# Enviar mensagem inicial
+send_telegram_message("Bot profissional iniciado com múltiplas melhorias.")
 
-    def run(self):
-        self.send_telegram("Bot profissional iniciado com múltiplas melhorias.")
-        interval_sec = self.config['interval_min'] * 60
-        next_run = time.time()
-        while True:
-            now = time.time()
-            if now >= next_run:
-                self.check_signals()
-                next_run = now + interval_sec
-            time.sleep(1)
+# Loop principal
+while True:
+    # Pegando os dados históricos para o par BTC/USDT
+    data = get_data('BTC/USDT')
 
-if __name__ == '__main__':
-    bot = TradeBot(binance, TELEGRAM_TOKEN, CHAT_ID, CONFIG)
-    bot.run()
+    # Calculando as EMAs e o RSI
+    data['ema_short'] = calculate_ema(data, ema_short_period)
+    data['ema_long'] = calculate_ema(data, ema_long_period)
+    data['rsi'] = calculate_rsi(data, rsi_period)
+
+    # Verificando a condição de cruzamento de EMAs
+    last_row = data.iloc[-1]
+    previous_row = data.iloc[-2]
+
+    order_type = None
+    order_price = None
+    stop_loss = None
+    take_profit = None
+
+    if last_row['ema_short'] > last_row['ema_long'] and previous_row['ema_short'] < previous_row['ema_long']:
+        order_type = 'Compra'
+        order_price = last_row['close']
+        stop_loss = order_price - 500  # Ajuste conforme sua estratégia
+        take_profit = order_price + 500  # Ajuste conforme sua estratégia
+        send_telegram_message(format_open_order(order_type, order_price, stop_loss, take_profit))
+        # Adicione seu código de execução de compra aqui, como por exemplo:
+        # exchange.create_market_buy_order('BTC/USDT', quantidade)
+
+    elif last_row['ema_short'] < last_row['ema_long'] and previous_row['ema_short'] > previous_row['ema_long']:
+        order_type = 'Venda'
+        order_price = last_row['close']
+        stop_loss = order_price + 500  # Ajuste conforme sua estratégia
+        take_profit = order_price - 500  # Ajuste conforme sua estratégia
+        send_telegram_message(format_open_order(order_type, order_price, stop_loss, take_profit))
+        # Adicione seu código de execução de venda aqui, como por exemplo:
+        # exchange.create_market_sell_order('BTC/USDT', quantidade)
+
+    # Aqui, você pode colocar a lógica para verificar se o preço atingiu o stop loss ou take profit
+    # Exemplo de como isso pode ser feito:
+    # Se o preço atingir o stop loss ou take profit, a ordem será fechada
+    # Simulação de fechamento de ordem (essa lógica deve ser ajustada conforme o seu uso real)
+    if order_type is not None:
+        current_price = last_row['close']  # Substitua por chamada real de preço
+        profit_loss = current_price - order_price  # Simulação simples de lucro/perda
+
+        if current_price <= stop_loss or current_price >= take_profit:
+            send_telegram_message(format_closed_order(order_type, order_price, stop_loss, take_profit, profit_loss))
+            order_type = None  # Resetando a ordem
+
+    # Espera de 15 minutos antes de pegar os novos dados
+    time.sleep(900)  # 900 segundos = 15 minutos
