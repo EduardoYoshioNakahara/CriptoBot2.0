@@ -2,7 +2,6 @@ import os
 import time
 import logging
 import sqlite3
-import schedule
 import ccxt
 import requests
 import pandas as pd
@@ -124,23 +123,9 @@ class TradeBot:
         df['vol_ma'] = df['volume'].rolling(window=self.config['volume_ma_period'], min_periods=1).mean()
         return df
 
-    def get_account_balance(self):
-        bal = self.exchange.fetch_balance()
-        return bal['total'].get('USDT', 0)
-
-    def calculate_position_size(self, entry_price, atr):
-        # Usa stake fixa em USDT e calcula quantidade
+    def calculate_position_size(self, entry_price):
         stake = self.config['stake_usdt']
-        size = stake / entry_price if entry_price > 0 else 0
-        return size
-
-    def log_trade(self, symbol, side, price, result):
-        ts = pd.Timestamp.utcnow().isoformat()
-        c.execute(
-            "INSERT INTO trades(ts, symbol, side, price, result) VALUES(?,?,?, ?,?)",
-            (ts, symbol, side, price, result)
-        )
-        conn.commit()
+        return stake / entry_price if entry_price > 0 else 0
 
     def confirm_multitimeframe(self, symbol):
         signals = []
@@ -166,21 +151,22 @@ class TradeBot:
                 entry_price = last['close']
                 atr = last['atr']
                 side = 'Compra' if signal=='BUY' else 'Venda'
-                # calcula stop e take profit baseados em ATR e RR 1:2
                 stop_loss = entry_price - atr
                 take_profit = entry_price + 2*(entry_price - stop_loss)
                 pnl_initial = 0.0
-                # envia status de ordem aberta
                 self.send_open_order_status(symbol, side, entry_price, stop_loss, take_profit, 'Em Aberto', pnl_initial)
-                # registra e atualiza sinal
                 self.log_trade(symbol, side, entry_price, pnl_initial)
                 self.last_signal[symbol] = signal
 
     def run(self):
         self.send_telegram("Bot profissional iniciado com múltiplas melhorias.")
-        schedule.every(self.config['interval_min']).minutes.do(self.check_signals)
+        interval_sec = self.config['interval_min'] * 60
+        next_run = time.time()
         while True:
-            schedule.run_pending()
+            now = time.time()
+            if now >= next_run:
+                self.check_signals()
+                next_run = now + interval_sec
             time.sleep(1)
 
 if __name__ == '__main__':
