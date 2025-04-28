@@ -4,21 +4,26 @@ import ccxt
 import time
 import requests
 import schedule
+from flask import Flask
 
-# Configuração da exchange (Binance)
+# Criar servidor para manter Railway vivo
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot de Trading Online 🚀"
+
+# Configurações da Binance
 exchange = ccxt.binance()
 
-# Telegram configs
+# Configurações do Telegram
 TELEGRAM_TOKEN = '7986770725:AAHD3vqPIZNLHvyWVZnrHIT3xGGI1R9ZeoY'
 CHAT_ID = '2091781134'
 
-# Função de enviar mensagem para o Telegram
+# Função para enviar mensagem no Telegram
 def send_telegram_message(message):
     url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-    params = {
-        'chat_id': CHAT_ID,
-        'text': message
-    }
+    params = {'chat_id': CHAT_ID, 'text': message}
     requests.get(url, params=params)
 
 # Funções de indicadores
@@ -42,25 +47,24 @@ def get_data(symbol, timeframe='1h', limit=100):
     data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
     return data
 
-# Parâmetros
+# Variáveis globais
 symbol = 'BTC/USDT'
 stake_usdt = 10
 ema_short_period = 9
 ema_long_period = 21
 rsi_period = 14
 
-# Variáveis globais de posição
-position = None  # None, 'buy', 'sell'
+position = None
 entry_price = 0
 stop_loss = 0
 take_profit = 0
 
-# Função principal para verificar sinal
+# Função para verificar sinal
 def check_signal():
     global position, entry_price, stop_loss, take_profit
 
     if position is not None:
-        return  # já tem operação aberta, não buscar novo sinal
+        return  # já tem operação aberta
 
     data = get_data(symbol)
     data['ema_short'] = calculate_ema(data, ema_short_period)
@@ -70,11 +74,10 @@ def check_signal():
     last_row = data.iloc[-1]
     previous_row = data.iloc[-2]
 
-    # Cruzamento de EMAs para compra
     if last_row['ema_short'] > last_row['ema_long'] and previous_row['ema_short'] <= previous_row['ema_long']:
         entry_price = last_row['close']
-        stop_loss = entry_price * 0.995  # 0.5% stop
-        take_profit = entry_price * 1.012  # 1.2% take
+        stop_loss = entry_price * 0.995
+        take_profit = entry_price * 1.012
         position = 'buy'
 
         msg = f"""📝 ORDEM ABERTA: {symbol}
@@ -85,15 +88,7 @@ Take Profit: {take_profit:.2f}
 Status: Aberto"""
         send_telegram_message(msg)
 
-    # Cruzamento de EMAs para venda (se quiser implementar venda)
-    # elif last_row['ema_short'] < last_row['ema_long'] and previous_row['ema_short'] >= previous_row['ema_long']:
-    #     entry_price = last_row['close']
-    #     stop_loss = entry_price * 1.005  # 0.5% stop
-    #     take_profit = entry_price * 0.988  # 1.2% take
-    #     position = 'sell'
-    #     (enviar mensagem igual a de compra)
-
-# Função para monitorar operação
+# Função para monitorar posição
 def monitor_position():
     global position, entry_price, stop_loss, take_profit
 
@@ -121,13 +116,20 @@ Prejuízo: {loss:.2f} USDT"""
             position = None
 
 # Mensagem inicial
-send_telegram_message("Bot de Trading PROFISSIONAL iniciado com sucesso!")
+send_telegram_message("🤖 Bot de Trading PROFISSIONAL iniciado com sucesso!")
 
 # Agendamento
 schedule.every(15).minutes.do(check_signal)
 schedule.every(1).minutes.do(monitor_position)
 
 # Loop principal
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+def run_bot():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+if __name__ == "__main__":
+    import threading
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+    app.run(host="0.0.0.0", port=3000)
