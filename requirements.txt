@@ -1,4 +1,6 @@
 ccxt
+requests
 pandas
-ta
-pyTelegramBotAPI
+numpy
+flask
+schedule
