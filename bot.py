@@ -1,135 +1,99 @@
+import ccxt
 import pandas as pd
 import numpy as np
-import ccxt
-import time
 import requests
-import schedule
-from flask import Flask
-
-# Criar servidor para manter Railway vivo
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot de Trading Online 🚀"
-
-# Configurações da Binance
-exchange = ccxt.binance()
+import time
 
 # Configurações do Telegram
 TELEGRAM_TOKEN = '7986770725:AAHD3vqPIZNLHvyWVZnrHIT3xGGI1R9ZeoY'
 CHAT_ID = '2091781134'
 
-# Função para enviar mensagem no Telegram
-def send_telegram_message(message):
-    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-    params = {'chat_id': CHAT_ID, 'text': message}
-    requests.get(url, params=params)
+# Configurações do Bot
+par = 'BTC/USDC'
+timeframe = '30m'
+exchange = ccxt.binance({
+    'enableRateLimit': True
+})
 
-# Funções de indicadores
-def calculate_ema(data, period):
-    return data['close'].ewm(span=period, adjust=False).mean()
+# Função para calcular indicadores
+def calcular_indicadores(df):
+    df['EMA9'] = df['close'].ewm(span=9).mean()
+    df['EMA21'] = df['close'].ewm(span=21).mean()
+    df['EMA50'] = df['close'].ewm(span=50).mean()
 
-def calculate_rsi(data, period):
-    delta = data['close'].diff()
-    gain = (delta.where(delta > 0, 0)).fillna(0)
-    loss = (-delta.where(delta < 0, 0)).fillna(0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
+    df['EMA_alinhadas'] = (df['EMA9'] > df['EMA21']) & (df['EMA21'] > df['EMA50'])
+
+    df['MACD_line'] = df['close'].ewm(span=12).mean() - df['close'].ewm(span=26).mean()
+    df['Signal_line'] = df['MACD_line'].ewm(span=9).mean()
+    df['MACD_cross'] = df['MACD_line'] > df['Signal_line']
+
+    df['RSI6'] = rsi(df['close'], 6)
+    df['RSI12'] = rsi(df['close'], 12)
+    df['RSI24'] = rsi(df['close'], 24)
+
+    df['RSI_ok'] = df['RSI6'] > 55
+
+    # Stochastic RSI
+    df['RSI14'] = rsi(df['close'], 14)
+    df['StochRSI_K'], df['StochRSI_D'] = stochastic_rsi(df['RSI14'])
+    df['StochRSI_cross'] = (df['StochRSI_K'] > df['StochRSI_D']) & (df['StochRSI_K'].shift(1) < df['StochRSI_D'].shift(1)) & (df['StochRSI_K'] < 20)
+
+    return df
+
+# Função RSI
+def rsi(series, period):
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(window=period).mean()
+    avg_loss = pd.Series(loss).rolling(window=period).mean()
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-# Função de pegar dados
-def get_data(symbol, timeframe='1h', limit=100):
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-    data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
-    return data
+# Função Stochastic RSI
+def stochastic_rsi(rsi_series, period=14, smoothK=3, smoothD=3):
+    min_rsi = rsi_series.rolling(window=period).min()
+    max_rsi = rsi_series.rolling(window=period).max()
+    stoch_rsi = (rsi_series - min_rsi) / (max_rsi - min_rsi)
+    stoch_rsi_k = stoch_rsi.rolling(window=smoothK).mean() * 100
+    stoch_rsi_d = stoch_rsi_k.rolling(window=smoothD).mean()
+    return stoch_rsi_k, stoch_rsi_d
 
-# Variáveis globais
-symbol = 'BTC/USDT'
-stake_usdt = 10
-ema_short_period = 9
-ema_long_period = 21
-rsi_period = 14
+# Função para enviar mensagem no Telegram
+def enviar_telegram(mensagem):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {'chat_id': CHAT_ID, 'text': mensagem}
+    requests.post(url, data=payload)
 
-position = None
-entry_price = 0
-stop_loss = 0
-take_profit = 0
+# Puxar dados
+def puxar_dados():
+    ohlcv = exchange.fetch_ohlcv(par, timeframe)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
 
-# Função para verificar sinal
-def check_signal():
-    global position, entry_price, stop_loss, take_profit
+# Bot loop
+while True:
+    try:
+        df = puxar_dados()
+        df = calcular_indicadores(df)
 
-    if position is not None:
-        return  # já tem operação aberta
+        ultimo = df.iloc[-1]
 
-    data = get_data(symbol)
-    data['ema_short'] = calculate_ema(data, ema_short_period)
-    data['ema_long'] = calculate_ema(data, ema_long_period)
-    data['rsi'] = calculate_rsi(data, rsi_period)
+        if ultimo['EMA_alinhadas'] and ultimo['MACD_cross'] and ultimo['RSI_ok'] and ultimo['StochRSI_cross']:
+            mensagem = (f"\u2728 SINAL DE COMPRA DETECTADO! \u2728\n"
+                        f"\nAtivo: {par}"
+                        f"\nTimeframe: {timeframe}"
+                        f"\nPreço atual: {ultimo['close']:.2f}"
+                        f"\n\nConfirmações:\n- EMAs alinhadas\n- MACD cruzado\n- RSI forte\n- Stochastic RSI cruzando")
+            print(mensagem)
+            enviar_telegram(mensagem)
+        else:
+            print(f"Sem sinal ainda... ({time.strftime('%H:%M:%S')})")
 
-    last_row = data.iloc[-1]
-    previous_row = data.iloc[-2]
+        time.sleep(60)
 
-    if last_row['ema_short'] > last_row['ema_long'] and previous_row['ema_short'] <= previous_row['ema_long']:
-        entry_price = last_row['close']
-        stop_loss = entry_price * 0.995
-        take_profit = entry_price * 1.012
-        position = 'buy'
-
-        msg = f"""📝 ORDEM ABERTA: {symbol}
-Tipo: Compra
-Entrada: {entry_price:.2f}
-Stop Loss: {stop_loss:.2f}
-Take Profit: {take_profit:.2f}
-Status: Aberto"""
-        send_telegram_message(msg)
-
-# Função para monitorar posição
-def monitor_position():
-    global position, entry_price, stop_loss, take_profit
-
-    if position is None:
-        return
-
-    ticker = exchange.fetch_ticker(symbol)
-    current_price = ticker['last']
-
-    if position == 'buy':
-        if current_price >= take_profit:
-            profit = (take_profit - entry_price) / entry_price * stake_usdt
-            msg = f"""✅ Take Profit atingido!
-Par: {symbol}
-Lucro: +{profit:.2f} USDT"""
-            send_telegram_message(msg)
-            position = None
-
-        elif current_price <= stop_loss:
-            loss = (stop_loss - entry_price) / entry_price * stake_usdt
-            msg = f"""❌ Stop Loss atingido!
-Par: {symbol}
-Prejuízo: {loss:.2f} USDT"""
-            send_telegram_message(msg)
-            position = None
-
-# Mensagem inicial
-send_telegram_message("🤖 Bot de Trading PROFISSIONAL iniciado com sucesso!")
-
-# Agendamento
-schedule.every(15).minutes.do(check_signal)
-schedule.every(1).minutes.do(monitor_position)
-
-# Loop principal
-def run_bot():
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-if __name__ == "__main__":
-    import threading
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.start()
-    app.run(host="0.0.0.0", port=3000)
+    except Exception as e:
+        print(f"Erro: {e}")
+        time.sleep(60)
